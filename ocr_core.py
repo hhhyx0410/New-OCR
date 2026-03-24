@@ -1,17 +1,73 @@
 import csv
+import importlib.util
 import json
 import os
+import platform
 import re
+import sys
 from pathlib import Path
 
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+os.environ.setdefault("PADDLE_PDX_DISABLE_DEVICE_FALLBACK", "True")
+os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "False")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
+
+class _NullWriter:
+    def write(self, _text):
+        return 0
+
+    def flush(self):
+        return None
+
+
+if getattr(sys, "frozen", False):
+    if sys.stdout is None:
+        sys.stdout = _NullWriter()
+    if sys.stderr is None:
+        sys.stderr = _NullWriter()
+
+import cv2  # noqa: F401
 from paddle.base.libpaddle import AnalysisConfig
 from paddlex import create_pipeline
+from paddlex.inference import PaddlePredictorOption
+from paddlex.utils import deps as paddlex_deps
 
 
 if not hasattr(AnalysisConfig, "set_optimization_level"):
     AnalysisConfig.set_optimization_level = lambda self, level: None
+
+
+if getattr(sys, "frozen", False):
+    _original_is_dep_available = paddlex_deps.is_dep_available
+    _original_is_extra_available = paddlex_deps.is_extra_available
+
+    def _frozen_is_dep_available(dep, /, check_version=False):
+        module_name_map = {
+            "opencv-contrib-python": "cv2",
+            "pypdfium2": "pypdfium2",
+            "python-bidi": "bidi",
+        }
+        if dep in module_name_map and not check_version:
+            return importlib.util.find_spec(module_name_map[dep]) is not None
+        return _original_is_dep_available(dep, check_version=check_version)
+
+    def _frozen_is_extra_available(extra):
+        if extra not in {"ocr", "ocr-core"}:
+            return _original_is_extra_available(extra)
+        required_specs = (
+            "cv2",
+            "imagesize",
+            "pyclipper",
+            "pypdfium2",
+            "bidi",
+            "shapely",
+        )
+        return all(importlib.util.find_spec(dep) is not None for dep in required_specs)
+
+    paddlex_deps.is_dep_available = _frozen_is_dep_available
+    paddlex_deps.is_extra_available = _frozen_is_extra_available
 
 
 HEADERS = [
@@ -55,12 +111,159 @@ VALUE_ALIASES = {
 EMPLOYEE_ID_PATTERN = re.compile(r"F[\sT1I\+\-_\.]*O?\d{1,4}", re.IGNORECASE)
 SUPPORTED_SUFFIXES = [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"]
 _PIPELINE = None
+APP_BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+BUNDLED_MODEL_ROOT = APP_BASE_DIR / "official_models"
+USER_MODEL_ROOT = Path(
+    os.environ.get("PADDLE_PDX_CACHE_HOME", str(Path.home() / ".paddlex"))
+) / "official_models"
+CPU_THREADS = 1
+OCR_MODEL_NAMES = (
+    "PP-LCNet_x1_0_doc_ori",
+    "UVDoc",
+    "PP-OCRv5_server_det",
+    "PP-LCNet_x1_0_textline_ori",
+    "PP-OCRv5_server_rec",
+)
+
+
+def _model_paths(model_root: Path):
+    return {model_name: model_root / model_name for model_name in OCR_MODEL_NAMES}
+
+
+def _build_local_ocr_config(model_root: Path):
+    model_paths = _model_paths(model_root)
+    return {
+        "pipeline_name": "OCR",
+        "text_type": "general",
+        "use_doc_preprocessor": True,
+        "use_textline_orientation": True,
+        "SubPipelines": {
+            "DocPreprocessor": {
+                "pipeline_name": "doc_preprocessor",
+                "use_doc_orientation_classify": True,
+                "use_doc_unwarping": True,
+                "SubModules": {
+                    "DocOrientationClassify": {
+                        "module_name": "doc_text_orientation",
+                        "model_name": "PP-LCNet_x1_0_doc_ori",
+                        "model_dir": str(model_paths["PP-LCNet_x1_0_doc_ori"]),
+                    },
+                    "DocUnwarping": {
+                        "module_name": "image_unwarping",
+                        "model_name": "UVDoc",
+                        "model_dir": str(model_paths["UVDoc"]),
+                    },
+                },
+            }
+        },
+        "SubModules": {
+            "TextDetection": {
+                "module_name": "text_detection",
+                "model_name": "PP-OCRv5_server_det",
+                "model_dir": str(model_paths["PP-OCRv5_server_det"]),
+                "limit_side_len": 64,
+                "limit_type": "min",
+                "max_side_limit": 4000,
+                "thresh": 0.3,
+                "box_thresh": 0.6,
+                "unclip_ratio": 1.5,
+            },
+            "TextLineOrientation": {
+                "module_name": "textline_orientation",
+                "model_name": "PP-LCNet_x1_0_textline_ori",
+                "model_dir": str(model_paths["PP-LCNet_x1_0_textline_ori"]),
+                "batch_size": 6,
+            },
+            "TextRecognition": {
+                "module_name": "text_recognition",
+                "model_name": "PP-OCRv5_server_rec",
+                "model_dir": str(model_paths["PP-OCRv5_server_rec"]),
+                "batch_size": 6,
+                "score_thresh": 0.0,
+            },
+        },
+    }
+
+
+def _missing_local_models(model_root: Path):
+    model_paths = _model_paths(model_root)
+    return [
+        f"{name}: {path}"
+        for name, path in model_paths.items()
+        if not path.exists()
+    ]
+
+
+def _build_predictor_option():
+    option = PaddlePredictorOption(
+        run_mode="paddle",
+        device_type="cpu",
+        cpu_threads=CPU_THREADS,
+        enable_new_ir=False,
+        enable_cinn=False,
+        delete_pass=[],
+    )
+    option.mkldnn_cache_capacity = 0
+    return option
+
+
+def _write_diagnostics(output_dir: Path, model_root: Path):
+    diagnostics = {
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "app_base_dir": str(APP_BASE_DIR),
+        "bundled_model_root": str(BUNDLED_MODEL_ROOT),
+        "active_model_root": str(model_root),
+        "user_model_root": str(USER_MODEL_ROOT),
+        "cpu_threads": CPU_THREADS,
+        "device": "cpu",
+        "run_mode": "paddle",
+        "mkldnn_enabled": False,
+        "enable_new_ir": False,
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "model_paths": {
+            model_name: str(model_root / model_name) for model_name in OCR_MODEL_NAMES
+        },
+        "missing_bundled_models": _missing_local_models(BUNDLED_MODEL_ROOT),
+        "missing_user_models": _missing_local_models(USER_MODEL_ROOT),
+        "env": {
+            "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS"),
+            "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS"),
+            "PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK": os.environ.get(
+                "PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"
+            ),
+            "PADDLE_PDX_DISABLE_DEVICE_FALLBACK": os.environ.get(
+                "PADDLE_PDX_DISABLE_DEVICE_FALLBACK"
+            ),
+            "PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT": os.environ.get(
+                "PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"
+            ),
+        },
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    diagnostic_path = output_dir / "ocr_runtime_diagnostics.json"
+    diagnostic_path.write_text(
+        json.dumps(diagnostics, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return diagnostic_path
 
 
 def get_pipeline():
     global _PIPELINE
     if _PIPELINE is None:
-        _PIPELINE = create_pipeline(pipeline="OCR")
+        missing_models = _missing_local_models(BUNDLED_MODEL_ROOT)
+        if missing_models:
+            details = "\n".join(missing_models)
+            raise RuntimeError(
+                "Bundled OCR models are unavailable. This build is configured to use only the packaged model set.\n"
+                f"Bundled model root: {BUNDLED_MODEL_ROOT}\nMissing model folders:\n{details}"
+            )
+        _PIPELINE = create_pipeline(
+            config=_build_local_ocr_config(BUNDLED_MODEL_ROOT),
+            device="cpu",
+            pp_option=_build_predictor_option(),
+        )
     return _PIPELINE
 
 
@@ -367,6 +570,7 @@ def process_image(image_path, output_dir):
     image_path = Path(image_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    diagnostic_path = _write_diagnostics(output_dir, BUNDLED_MODEL_ROOT)
 
     results = get_pipeline().predict(str(image_path))
     result = next(iter(results))
@@ -391,6 +595,7 @@ def process_image(image_path, output_dir):
         "output_stem": output_stem,
         "ocr_image_path": str(ocr_image_path) if ocr_image_path else "",
         "csv_path": str(csv_path),
+        "diagnostic_path": str(diagnostic_path),
         "rows": rows,
         "table_rows": rows_to_dicts(rows),
     }

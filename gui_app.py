@@ -2,6 +2,7 @@ import csv
 import shutil
 import sys
 import tempfile
+import traceback
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -32,6 +33,12 @@ from ocr_core import process_image
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+def default_image_directory() -> str:
+    if getattr(sys, "frozen", False):
+        return str(Path.home() / "Pictures")
+    return str(Path(__file__).resolve().parent / "images")
 
 
 class ClickableImageLabel(QLabel):
@@ -227,6 +234,7 @@ class OcrWindow(QMainWindow):
         self.current_result_index = -1
         self.results = []
         self.temp_dir = Path(tempfile.mkdtemp(prefix="timesheet_ocr_"))
+        self.error_log_path = self.temp_dir / "ocr_error.log"
 
         self.metric_image = InfoBadge("Selected Files", "0")
         self.metric_employee = InfoBadge("Employee ID", "Pending")
@@ -618,7 +626,7 @@ class OcrWindow(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Select Images",
-            str(Path(__file__).resolve().parent / "images"),
+            default_image_directory(),
             "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)",
         )
         if not paths:
@@ -662,7 +670,13 @@ class OcrWindow(QMainWindow):
             self.statusBar().showMessage(f"OCR completed for {len(self.results)} image(s).")
         except Exception as exc:
             self.metric_status.set_value("Failed")
-            QMessageBox.critical(self, "OCR Failed", str(exc))
+            details = traceback.format_exc()
+            self.error_log_path.write_text(details, encoding="utf-8")
+            QMessageBox.critical(
+                self,
+                "OCR Failed",
+                f"{exc}\n\nFull error log:\n{self.error_log_path}",
+            )
             self.statusBar().showMessage("OCR failed.")
 
     def on_result_selection_changed(self):
@@ -726,11 +740,18 @@ class OcrWindow(QMainWindow):
             return
 
         target_dir = Path(target_dir)
+        copied_diagnostics = set()
         for result in self.results:
             ocr_image_path = Path(result["ocr_image_path"])
             csv_path = Path(result["csv_path"])
             shutil.copy2(ocr_image_path, target_dir / ocr_image_path.name)
             shutil.copy2(csv_path, target_dir / csv_path.name)
+            diagnostic_path = result.get("diagnostic_path")
+            if diagnostic_path:
+                diagnostic_path = Path(diagnostic_path)
+                if diagnostic_path.exists() and diagnostic_path.name not in copied_diagnostics:
+                    shutil.copy2(diagnostic_path, target_dir / diagnostic_path.name)
+                    copied_diagnostics.add(diagnostic_path.name)
 
         QMessageBox.information(
             self,
