@@ -9,9 +9,7 @@ from pathlib import Path
 
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 os.environ.setdefault("PADDLE_PDX_DISABLE_DEVICE_FALLBACK", "True")
-os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "False")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "True")
 
 
 class _NullWriter:
@@ -82,7 +80,7 @@ HEADERS = [
     "Supervisor Name & Signature",
 ]
 
-COLUMN_RANGES = [
+DEFAULT_COLUMN_RANGES = [
     (0, 60),
     (60, 175),
     (175, 280),
@@ -108,6 +106,18 @@ VALUE_ALIASES = {
     "DW": "DW",
 }
 
+HEADER_KEYWORDS = [
+    ("Date", ("DATE",)),
+    ("Regular Hours", ("REGULAR", "HOURS")),
+    ("OT Hours / Allowance", ("OT", "HOUR")),
+    ("Rope Access Allowance", ("ROPE", "ACCESS")),
+    ("Transport Allowance", ("TRANSPORT",)),
+    ("Night Shift Allowance", ("NIGHT", "SHIFT")),
+    ("Food Allowance", ("FOOD",)),
+    ("Job Site", ("JOB", "SITE")),
+    ("Supervisor Name & Signature", ("SUPERVISOR", "SIGNATURE")),
+]
+
 EMPLOYEE_ID_PATTERN = re.compile(r"F[\sT1I\+\-_\.]*O?\d{1,4}", re.IGNORECASE)
 SUPPORTED_SUFFIXES = [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"]
 _PIPELINE = None
@@ -116,7 +126,8 @@ BUNDLED_MODEL_ROOT = APP_BASE_DIR / "official_models"
 USER_MODEL_ROOT = Path(
     os.environ.get("PADDLE_PDX_CACHE_HOME", str(Path.home() / ".paddlex"))
 ) / "official_models"
-CPU_THREADS = 1
+CPU_THREADS = max(1, min(int(os.environ.get("TIMESHEET_OCR_CPU_THREADS", os.cpu_count() or 1)), 4))
+ENABLE_MKLDNN = os.environ.get("TIMESHEET_OCR_ENABLE_MKLDNN", "1") == "1"
 OCR_MODEL_NAMES = (
     "PP-LCNet_x1_0_doc_ori",
     "UVDoc",
@@ -124,6 +135,14 @@ OCR_MODEL_NAMES = (
     "PP-LCNet_x1_0_textline_ori",
     "PP-OCRv5_server_rec",
 )
+USE_DOC_PREPROCESSOR = os.environ.get("TIMESHEET_OCR_USE_DOC_PREPROCESSOR", "0") == "1"
+USE_DOC_UNWARPING = os.environ.get("TIMESHEET_OCR_USE_DOC_UNWARPING", "0") == "1"
+USE_TEXTLINE_ORIENTATION = os.environ.get("TIMESHEET_OCR_USE_TEXTLINE_ORIENTATION", "0") == "1"
+WRITE_DIAGNOSTICS_ON_SUCCESS = os.environ.get("TIMESHEET_OCR_WRITE_DIAGNOSTICS", "0") == "1"
+PRINT_OCR_RESULT = os.environ.get("TIMESHEET_OCR_PRINT_RESULT", "0") == "1"
+
+os.environ["OMP_NUM_THREADS"] = str(CPU_THREADS)
+os.environ["MKL_NUM_THREADS"] = str(CPU_THREADS)
 
 
 def _model_paths(model_root: Path):
@@ -132,30 +151,11 @@ def _model_paths(model_root: Path):
 
 def _build_local_ocr_config(model_root: Path):
     model_paths = _model_paths(model_root)
-    return {
+    config = {
         "pipeline_name": "OCR",
         "text_type": "general",
-        "use_doc_preprocessor": True,
-        "use_textline_orientation": True,
-        "SubPipelines": {
-            "DocPreprocessor": {
-                "pipeline_name": "doc_preprocessor",
-                "use_doc_orientation_classify": True,
-                "use_doc_unwarping": True,
-                "SubModules": {
-                    "DocOrientationClassify": {
-                        "module_name": "doc_text_orientation",
-                        "model_name": "PP-LCNet_x1_0_doc_ori",
-                        "model_dir": str(model_paths["PP-LCNet_x1_0_doc_ori"]),
-                    },
-                    "DocUnwarping": {
-                        "module_name": "image_unwarping",
-                        "model_name": "UVDoc",
-                        "model_dir": str(model_paths["UVDoc"]),
-                    },
-                },
-            }
-        },
+        "use_doc_preprocessor": USE_DOC_PREPROCESSOR,
+        "use_textline_orientation": USE_TEXTLINE_ORIENTATION,
         "SubModules": {
             "TextDetection": {
                 "module_name": "text_detection",
@@ -183,6 +183,27 @@ def _build_local_ocr_config(model_root: Path):
             },
         },
     }
+    if USE_DOC_PREPROCESSOR:
+        doc_preprocessor = {
+            "pipeline_name": "doc_preprocessor",
+            "use_doc_orientation_classify": True,
+            "use_doc_unwarping": USE_DOC_UNWARPING,
+            "SubModules": {
+                "DocOrientationClassify": {
+                    "module_name": "doc_text_orientation",
+                    "model_name": "PP-LCNet_x1_0_doc_ori",
+                    "model_dir": str(model_paths["PP-LCNet_x1_0_doc_ori"]),
+                },
+            },
+        }
+        if USE_DOC_UNWARPING:
+            doc_preprocessor["SubModules"]["DocUnwarping"] = {
+                "module_name": "image_unwarping",
+                "model_name": "UVDoc",
+                "model_dir": str(model_paths["UVDoc"]),
+            }
+        config["SubPipelines"] = {"DocPreprocessor": doc_preprocessor}
+    return config
 
 
 def _missing_local_models(model_root: Path):
@@ -203,21 +224,53 @@ def _build_predictor_option():
         enable_cinn=False,
         delete_pass=[],
     )
-    option.mkldnn_cache_capacity = 0
+    try:
+        option.mkldnn_cache_capacity = 10 if ENABLE_MKLDNN else 0
+    except Exception:
+        pass
+    try:
+        option.enable_mkldnn = ENABLE_MKLDNN
+    except Exception:
+        pass
     return option
 
 
-def _write_diagnostics(output_dir: Path, model_root: Path):
+def _resolve_model_root():
+    candidate_roots = []
+    if BUNDLED_MODEL_ROOT not in candidate_roots:
+        candidate_roots.append(BUNDLED_MODEL_ROOT)
+    if USER_MODEL_ROOT not in candidate_roots:
+        candidate_roots.append(USER_MODEL_ROOT)
+
+    for model_root in candidate_roots:
+        missing_models = _missing_local_models(model_root)
+        if not missing_models:
+            source = "bundled" if model_root == BUNDLED_MODEL_ROOT else "user-cache"
+            return model_root, source, candidate_roots
+
+    details = "\n".join(
+        f"{model_root} -> missing {', '.join(item.split(':', 1)[0] for item in _missing_local_models(model_root))}"
+        for model_root in candidate_roots
+    )
+    raise RuntimeError(
+        "OCR models are unavailable. Neither the packaged model set nor the local PaddleX cache contains a complete OCR model bundle.\n"
+        f"Checked model roots:\n{details}"
+    )
+
+
+def _write_diagnostics(output_dir: Path, model_root: Path, model_source: str, candidate_roots):
     diagnostics = {
         "frozen": bool(getattr(sys, "frozen", False)),
         "app_base_dir": str(APP_BASE_DIR),
         "bundled_model_root": str(BUNDLED_MODEL_ROOT),
         "active_model_root": str(model_root),
+        "active_model_source": model_source,
         "user_model_root": str(USER_MODEL_ROOT),
+        "candidate_model_roots": [str(path) for path in candidate_roots],
         "cpu_threads": CPU_THREADS,
         "device": "cpu",
         "run_mode": "paddle",
-        "mkldnn_enabled": False,
+        "mkldnn_enabled": ENABLE_MKLDNN,
         "enable_new_ir": False,
         "python_version": sys.version,
         "platform": platform.platform(),
@@ -229,6 +282,27 @@ def _write_diagnostics(output_dir: Path, model_root: Path):
         "env": {
             "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS"),
             "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS"),
+            "TIMESHEET_OCR_USE_DOC_PREPROCESSOR": os.environ.get(
+                "TIMESHEET_OCR_USE_DOC_PREPROCESSOR"
+            ),
+            "TIMESHEET_OCR_USE_DOC_UNWARPING": os.environ.get(
+                "TIMESHEET_OCR_USE_DOC_UNWARPING"
+            ),
+            "TIMESHEET_OCR_USE_TEXTLINE_ORIENTATION": os.environ.get(
+                "TIMESHEET_OCR_USE_TEXTLINE_ORIENTATION"
+            ),
+            "TIMESHEET_OCR_CPU_THREADS": os.environ.get(
+                "TIMESHEET_OCR_CPU_THREADS"
+            ),
+            "TIMESHEET_OCR_ENABLE_MKLDNN": os.environ.get(
+                "TIMESHEET_OCR_ENABLE_MKLDNN"
+            ),
+            "TIMESHEET_OCR_WRITE_DIAGNOSTICS": os.environ.get(
+                "TIMESHEET_OCR_WRITE_DIAGNOSTICS"
+            ),
+            "TIMESHEET_OCR_PRINT_RESULT": os.environ.get(
+                "TIMESHEET_OCR_PRINT_RESULT"
+            ),
             "PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK": os.environ.get(
                 "PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"
             ),
@@ -252,15 +326,9 @@ def _write_diagnostics(output_dir: Path, model_root: Path):
 def get_pipeline():
     global _PIPELINE
     if _PIPELINE is None:
-        missing_models = _missing_local_models(BUNDLED_MODEL_ROOT)
-        if missing_models:
-            details = "\n".join(missing_models)
-            raise RuntimeError(
-                "Bundled OCR models are unavailable. This build is configured to use only the packaged model set.\n"
-                f"Bundled model root: {BUNDLED_MODEL_ROOT}\nMissing model folders:\n{details}"
-            )
+        model_root, _, _ = _resolve_model_root()
         _PIPELINE = create_pipeline(
-            config=_build_local_ocr_config(BUNDLED_MODEL_ROOT),
+            config=_build_local_ocr_config(model_root),
             device="cpu",
             pp_option=_build_predictor_option(),
         )
@@ -296,6 +364,20 @@ def find_label_item(items, label_text: str):
         return None
     candidates.sort(key=lambda item: (item["y1"], item["x1"]))
     return candidates[0]
+
+
+def find_keyword_items(items, keywords, y_min=None, y_max=None):
+    matches = []
+    for item in items:
+        if y_min is not None and item["cy"] < y_min:
+            continue
+        if y_max is not None and item["cy"] > y_max:
+            continue
+        normalized = normalize_label(item["text"])
+        if all(keyword in normalized for keyword in keywords):
+            matches.append(item)
+    matches.sort(key=lambda item: (item["y1"], item["x1"]))
+    return matches
 
 
 def extract_band_text(items, anchor_item, x_min, x_max, y_tolerance=26):
@@ -378,10 +460,10 @@ def find_employee_id(items):
     return ""
 
 
-def group_by_column(items):
-    columns = [[] for _ in COLUMN_RANGES]
+def group_by_column(items, column_ranges):
+    columns = [[] for _ in column_ranges]
     for item in items:
-        for index, (x_min, x_max) in enumerate(COLUMN_RANGES):
+        for index, (x_min, x_max) in enumerate(column_ranges):
             if x_min <= item["cx"] < x_max:
                 columns[index].append(item)
                 break
@@ -391,6 +473,52 @@ def group_by_column(items):
         column_items.sort(key=lambda item: item["x1"])
         values.append(" ".join(normalize_text(item["text"]) for item in column_items))
     return values
+
+
+def build_column_ranges(items, header_bottom, total_top):
+    header_region_top = max(0, header_bottom - 120)
+    header_region_bottom = min(total_top, header_bottom + 40)
+    anchors = []
+
+    for index, (_, keywords) in enumerate(HEADER_KEYWORDS):
+        matches = find_keyword_items(
+            items,
+            keywords,
+            y_min=header_region_top,
+            y_max=header_region_bottom,
+        )
+        if not matches:
+            continue
+        left = min(item["x1"] for item in matches)
+        right = max(item["x2"] for item in matches)
+        anchors.append(
+            {
+                "index": index,
+                "left": left,
+                "right": right,
+                "center": (left + right) / 2,
+            }
+        )
+
+    # We only derive custom column boundaries when all headers are found;
+    # partial OCR matches can otherwise produce too few boundaries and crash.
+    if len(anchors) < len(HEADERS):
+        return DEFAULT_COLUMN_RANGES
+
+    anchors.sort(key=lambda anchor: anchor["center"])
+    boundaries = [0]
+    for left_anchor, right_anchor in zip(anchors, anchors[1:]):
+        midpoint = int((left_anchor["center"] + right_anchor["center"]) / 2)
+        boundaries.append(midpoint)
+    boundaries.append(9999)
+
+    if len(boundaries) != len(HEADERS) + 1:
+        return DEFAULT_COLUMN_RANGES
+
+    column_ranges = []
+    for index in range(len(HEADERS)):
+        column_ranges.append((boundaries[index], boundaries[index + 1]))
+    return column_ranges
 
 
 def assign_items_to_rows(table_items, row_centers, row_tolerance, first_data_x):
@@ -411,6 +539,32 @@ def normalize_ot_hours(value: str) -> str:
     value = normalize_text(value)
     digits = "".join(char for char in value if char.isdigit())
     return digits if digits else "NA"
+
+
+def normalize_regular_hours(value: str, row_index: int | None = None) -> str:
+    value = normalize_text(value)
+    tokens = value.split()
+    if len(tokens) < 2:
+        return value
+
+    prefix = tokens[0].strip(".,;:|")
+    suffix = " ".join(tokens[1:]).strip()
+    if not suffix:
+        return value
+
+    digits = "".join(char for char in prefix if char.isdigit())
+    if digits:
+        try:
+            day = int(digits)
+        except ValueError:
+            day = None
+        if day is not None and 1 <= day <= 31 and (row_index is None or day == row_index):
+            return suffix
+
+    if row_index is not None and row_index < 10 and prefix.upper() in {"L", "I", "|"}:
+        return suffix
+
+    return value
 
 
 def normalize_rope_access(value: str) -> str:
@@ -477,8 +631,9 @@ def estimate_row_centers(items):
 
 def apply_table_corrections(rows):
     corrected_rows = rows[:5]
-    for row in rows[5:-1]:
+    for row_offset, row in enumerate(rows[5:-1], start=1):
         fixed = row[:]
+        fixed[1] = normalize_regular_hours(fixed[1], row_offset)
         fixed[2] = normalize_ot_hours(fixed[2])
         fixed[3] = normalize_rope_access(fixed[3])
         corrected_rows.append(fixed)
@@ -537,22 +692,31 @@ def build_rows(result):
 
     header_bottom = detect_header_bottom(items)
     total_top = detect_total_top(items)
-    regular_hours_label = find_label_item(items, "Regular Hours")
-    first_data_x = regular_hours_label["x1"] if regular_hours_label else 110
+    column_ranges = build_column_ranges(items, header_bottom, total_top)
+    first_data_x = column_ranges[1][0] + 25
     table_items = [item for item in items if header_bottom <= item["cy"] < total_top]
     row_tolerance = max(18, row_step * 0.42)
     row_buckets = assign_items_to_rows(
         table_items, row_centers, row_tolerance, first_data_x
     )
     for row_index, row_bucket in enumerate(row_buckets, start=1):
-        row_values = group_by_column(row_bucket)
+        row_values = group_by_column(row_bucket, column_ranges)
         row_values[0] = str(row_index)
         rows.append(row_values)
 
     total_values = ["Total", "", "", "", "", "", "", "", ""]
-    total_values[1] = extract_numeric_region_text(items, 90, 180, 1395, 1460)
-    total_values[2] = extract_numeric_region_text(items, 180, 270, 1395, 1475)
-    total_values[3] = extract_numeric_region_text(items, 280, 380, 1395, 1460)
+    total_label = find_label_item(items, "Total")
+    total_y_min = total_label["y1"] - 25 if total_label is not None else total_top - 20
+    total_y_max = total_label["y2"] + 35 if total_label is not None else total_top + 60
+    total_values[1] = extract_numeric_region_text(
+        items, column_ranges[1][0], column_ranges[1][1], total_y_min, total_y_max
+    )
+    total_values[2] = extract_numeric_region_text(
+        items, column_ranges[2][0], column_ranges[2][1], total_y_min, total_y_max
+    )
+    total_values[3] = extract_numeric_region_text(
+        items, column_ranges[3][0], column_ranges[3][1], total_y_min, total_y_max
+    )
     rows.append(total_values)
     return apply_table_corrections(rows), employee_id
 
@@ -570,35 +734,55 @@ def process_image(image_path, output_dir):
     image_path = Path(image_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    diagnostic_path = _write_diagnostics(output_dir, BUNDLED_MODEL_ROOT)
+    model_root, model_source, candidate_roots = _resolve_model_root()
+    diagnostic_path = None
 
-    results = get_pipeline().predict(str(image_path))
-    result = next(iter(results))
-    result.print()
-    rows, employee_id = build_rows(result)
-    output_stem = safe_stem(employee_id, image_path.stem)
+    try:
+        if WRITE_DIAGNOSTICS_ON_SUCCESS:
+            diagnostic_path = _write_diagnostics(
+                output_dir,
+                model_root,
+                model_source,
+                candidate_roots,
+            )
 
-    result.save_to_img(str(output_dir))
-    ocr_image_path = move_generated_file(
-        output_dir, image_path.stem, "_ocr_res_img", f"{output_stem}_ocr-res"
-    )
-    preprocessed_path = move_generated_file(
-        output_dir, image_path.stem, "_preprocessed_img", f"{output_stem}_preprocessed"
-    )
-    if preprocessed_path and preprocessed_path.exists():
-        preprocessed_path.unlink()
+        results = get_pipeline().predict(str(image_path))
+        result = next(iter(results))
+        if PRINT_OCR_RESULT:
+            result.print()
+        rows, employee_id = build_rows(result)
+        output_stem = safe_stem(employee_id, image_path.stem)
 
-    csv_path = output_dir / f"{output_stem}.csv"
-    export_csv(rows, csv_path)
-    return {
-        "employee_id": employee_id,
-        "output_stem": output_stem,
-        "ocr_image_path": str(ocr_image_path) if ocr_image_path else "",
-        "csv_path": str(csv_path),
-        "diagnostic_path": str(diagnostic_path),
-        "rows": rows,
-        "table_rows": rows_to_dicts(rows),
-    }
+        result.save_to_img(str(output_dir))
+        ocr_image_path = move_generated_file(
+            output_dir, image_path.stem, "_ocr_res_img", f"{output_stem}_ocr-res"
+        )
+        preprocessed_path = move_generated_file(
+            output_dir, image_path.stem, "_preprocessed_img", f"{output_stem}_preprocessed"
+        )
+        if preprocessed_path and preprocessed_path.exists():
+            preprocessed_path.unlink()
+
+        csv_path = output_dir / f"{output_stem}.csv"
+        export_csv(rows, csv_path)
+        return {
+            "employee_id": employee_id,
+            "output_stem": output_stem,
+            "ocr_image_path": str(ocr_image_path) if ocr_image_path else "",
+            "csv_path": str(csv_path),
+            "diagnostic_path": str(diagnostic_path) if diagnostic_path else "",
+            "rows": rows,
+            "table_rows": rows_to_dicts(rows),
+        }
+    except Exception:
+        if diagnostic_path is None:
+            _write_diagnostics(
+                output_dir,
+                model_root,
+                model_source,
+                candidate_roots,
+            )
+        raise
 
 
 def load_manifest(manifest_path: Path):
