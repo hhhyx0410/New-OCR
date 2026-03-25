@@ -1,4 +1,5 @@
 import csv
+import importlib
 import importlib.util
 import json
 import os
@@ -27,6 +28,7 @@ if getattr(sys, "frozen", False):
         sys.stderr = _NullWriter()
 
 import cv2  # noqa: F401
+import pyclipper  # noqa: F401
 from paddle.base.libpaddle import AnalysisConfig
 from paddlex import create_pipeline
 from paddlex.inference import PaddlePredictorOption
@@ -41,14 +43,26 @@ if getattr(sys, "frozen", False):
     _original_is_dep_available = paddlex_deps.is_dep_available
     _original_is_extra_available = paddlex_deps.is_extra_available
 
+    def _module_exists(module_name: str) -> bool:
+        if module_name in sys.modules:
+            return True
+        try:
+            importlib.import_module(module_name)
+            return True
+        except Exception:
+            return importlib.util.find_spec(module_name) is not None
+
     def _frozen_is_dep_available(dep, /, check_version=False):
         module_name_map = {
             "opencv-contrib-python": "cv2",
+            "pyclipper": "pyclipper",
+            "imagesize": "imagesize",
             "pypdfium2": "pypdfium2",
             "python-bidi": "bidi",
+            "shapely": "shapely",
         }
         if dep in module_name_map and not check_version:
-            return importlib.util.find_spec(module_name_map[dep]) is not None
+            return _module_exists(module_name_map[dep])
         return _original_is_dep_available(dep, check_version=check_version)
 
     def _frozen_is_extra_available(extra):
@@ -62,10 +76,52 @@ if getattr(sys, "frozen", False):
             "bidi",
             "shapely",
         )
-        return all(importlib.util.find_spec(dep) is not None for dep in required_specs)
+        return all(_module_exists(dep) for dep in required_specs)
 
     paddlex_deps.is_dep_available = _frozen_is_dep_available
     paddlex_deps.is_extra_available = _frozen_is_extra_available
+
+    def _patch_paddlex_cv2_modules():
+        module_names = (
+            "paddlex.inference.common.reader.image_reader",
+            "paddlex.inference.utils.io.readers",
+            "paddlex.inference.utils.io.writers",
+            "paddlex.inference.models.common.vision.funcs",
+            "paddlex.inference.models.common.vision.processors",
+            "paddlex.inference.models.text_detection.processors",
+            "paddlex.inference.models.text_detection.result",
+            "paddlex.inference.models.text_recognition.processors",
+            "paddlex.inference.pipelines.components.common.crop_image_regions",
+            "paddlex.inference.pipelines.components.common.seal_det_warp",
+            "paddlex.inference.pipelines.components.common.warp_image",
+            "paddlex.inference.pipelines.ocr.result",
+        )
+        for module_name in module_names:
+            try:
+                module = importlib.import_module(module_name)
+            except Exception:
+                continue
+            if getattr(module, "cv2", None) is None:
+                module.cv2 = cv2
+
+    def _patch_paddlex_dependency_modules():
+        _patch_paddlex_cv2_modules()
+
+        module_bindings = {
+            "paddlex.inference.models.text_detection.processors": {
+                "pyclipper": pyclipper,
+            },
+        }
+        for module_name, bindings in module_bindings.items():
+            try:
+                module = importlib.import_module(module_name)
+            except Exception:
+                continue
+            for attr_name, attr_value in bindings.items():
+                if getattr(module, attr_name, None) is None:
+                    setattr(module, attr_name, attr_value)
+
+    _patch_paddlex_dependency_modules()
 
 
 HEADERS = [
