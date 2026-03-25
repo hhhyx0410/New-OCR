@@ -531,6 +531,173 @@ def group_by_column(items, column_ranges):
     return values
 
 
+def _coerce_numeric_token(value: str) -> str:
+    compact = normalize_text(value).upper().replace(" ", "")
+    compact = compact.replace("O", "0").replace("I", "1").replace("L", "1")
+    compact = compact.replace("B", "8").replace("S", "5").replace("G", "6")
+    compact = compact.replace(",", "").replace(":", "").replace(";", "")
+    return compact
+
+
+def _parse_numeric_token(value: str):
+    compact = _coerce_numeric_token(value).replace("$", "")
+    match = re.search(r"\d+(?:\.\d+)?", compact)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _is_regular_hours_token(value: str) -> bool:
+    text = normalize_text(value).strip()
+    if not text:
+        return False
+
+    compact = _coerce_numeric_token(text)
+    letters_only = re.sub(r"[^A-Z]", "", compact)
+    if letters_only in {"OFF", "OFS", "OFP", "OPP", "PH", "PH", "PHT", "POTT"}:
+        return True
+
+    number = _parse_numeric_token(text)
+    if number is None:
+        return False
+    return 6 <= number <= 12
+
+
+def _is_ot_hours_token(value: str) -> bool:
+    text = normalize_text(value).strip()
+    if not text:
+        return False
+    number = _parse_numeric_token(text)
+    if number is None:
+        return False
+    return 0 <= number <= 4
+
+
+def infer_value_anchors(items, header_bottom, total_top):
+    table_items = [
+        item
+        for item in items
+        if header_bottom <= item["cy"] < total_top and normalize_text(item["text"]) != "Total"
+    ]
+    if not table_items:
+        return []
+
+    inferred = {index: [] for index in range(4)}
+    date_scan_limit = max(DEFAULT_COLUMN_RANGES[1][0] + 80, 140)
+
+    for item in table_items:
+        text = normalize_text(item["text"])
+        compact = _coerce_numeric_token(text)
+        number = _parse_numeric_token(text)
+        if number is None:
+            continue
+
+        if "$" in text or compact.startswith("$"):
+            if int(number) == 10:
+                inferred[3].append(item)
+            continue
+
+        if _is_regular_hours_token(text):
+            inferred[1].append(item)
+            continue
+
+        if _is_ot_hours_token(text) and item["x1"] > date_scan_limit:
+            inferred[2].append(item)
+            continue
+
+        if compact.isdigit():
+            day_value = int(compact)
+            if 1 <= day_value <= 31 and item["x1"] <= date_scan_limit:
+                inferred[0].append(item)
+                continue
+            if 0 <= day_value <= 4 and item["x1"] > date_scan_limit:
+                inferred[2].append(item)
+                continue
+            if 8 <= day_value <= 24:
+                inferred[1].append(item)
+                continue
+
+        if 8 <= number <= 24:
+            inferred[1].append(item)
+
+    if inferred[0] and inferred[1]:
+        date_center = sorted(item["cx"] for item in inferred[0])[len(inferred[0]) // 2]
+        right_side_regulars = [
+            item for item in inferred[1] if item["cx"] > date_center + 10
+        ]
+        if right_side_regulars:
+            inferred[1] = right_side_regulars
+
+    anchors = []
+    for index, matches in inferred.items():
+        if not matches:
+            continue
+        matches.sort(key=lambda item: item["cx"])
+        centers = [item["cx"] for item in matches]
+        center = centers[len(centers) // 2]
+        left = min(item["x1"] for item in matches)
+        right = max(item["x2"] for item in matches)
+        anchors.append(
+            {
+                "index": index,
+                "left": left,
+                "right": right,
+                "center": center,
+                "source": "value-pattern",
+            }
+        )
+    return anchors
+
+
+def _build_ranges_from_anchors(anchors):
+    if len(anchors) < 3:
+        return DEFAULT_COLUMN_RANGES
+
+    default_centers = [
+        (left + right) / 2 for left, right in DEFAULT_COLUMN_RANGES
+    ]
+    centers = [None] * len(HEADERS)
+    for anchor in anchors:
+        centers[anchor["index"]] = anchor["center"]
+
+    known = [(index, center) for index, center in enumerate(centers) if center is not None]
+    if len(known) < 3:
+        return DEFAULT_COLUMN_RANGES
+
+    if len(known) >= 2:
+        first_index, first_center = known[0]
+        last_index, last_center = known[-1]
+        default_span = default_centers[last_index] - default_centers[first_index]
+        actual_span = last_center - first_center
+        scale = actual_span / default_span if default_span and actual_span > 0 else 1.0
+    else:
+        scale = 1.0
+    offset = sum(center - default_centers[index] * scale for index, center in known) / len(known)
+
+    for index, center in enumerate(centers):
+        if center is None:
+            centers[index] = default_centers[index] * scale + offset
+
+    for index in range(1, len(centers)):
+        minimum = centers[index - 1] + 20
+        if centers[index] < minimum:
+            centers[index] = minimum
+
+    boundaries = [0]
+    for left_center, right_center in zip(centers, centers[1:]):
+        boundaries.append(int((left_center + right_center) / 2))
+    boundaries.append(9999)
+
+    if len(boundaries) != len(HEADERS) + 1:
+        return DEFAULT_COLUMN_RANGES
+    return [
+        (boundaries[index], boundaries[index + 1]) for index in range(len(HEADERS))
+    ]
+
+
 def build_column_ranges(items, header_bottom, total_top):
     header_region_top = max(0, header_bottom - 120)
     header_region_bottom = min(total_top, header_bottom + 40)
@@ -556,25 +723,13 @@ def build_column_ranges(items, header_bottom, total_top):
             }
         )
 
-    # We only derive custom column boundaries when all headers are found;
-    # partial OCR matches can otherwise produce too few boundaries and crash.
-    if len(anchors) < len(HEADERS):
-        return DEFAULT_COLUMN_RANGES
+    anchor_by_index = {anchor["index"]: anchor for anchor in anchors}
+    for inferred_anchor in infer_value_anchors(items, header_bottom, total_top):
+        anchor_by_index.setdefault(inferred_anchor["index"], inferred_anchor)
 
-    anchors.sort(key=lambda anchor: anchor["center"])
-    boundaries = [0]
-    for left_anchor, right_anchor in zip(anchors, anchors[1:]):
-        midpoint = int((left_anchor["center"] + right_anchor["center"]) / 2)
-        boundaries.append(midpoint)
-    boundaries.append(9999)
-
-    if len(boundaries) != len(HEADERS) + 1:
-        return DEFAULT_COLUMN_RANGES
-
-    column_ranges = []
-    for index in range(len(HEADERS)):
-        column_ranges.append((boundaries[index], boundaries[index + 1]))
-    return column_ranges
+    return _build_ranges_from_anchors(
+        [anchor_by_index[index] for index in sorted(anchor_by_index)]
+    )
 
 
 def assign_items_to_rows(table_items, row_centers, row_tolerance, first_data_x):
@@ -749,7 +904,7 @@ def build_rows(result):
     header_bottom = detect_header_bottom(items)
     total_top = detect_total_top(items)
     column_ranges = build_column_ranges(items, header_bottom, total_top)
-    first_data_x = column_ranges[1][0] + 25
+    first_data_x = column_ranges[1][0]
     table_items = [item for item in items if header_bottom <= item["cy"] < total_top]
     row_tolerance = max(18, row_step * 0.42)
     row_buckets = assign_items_to_rows(
